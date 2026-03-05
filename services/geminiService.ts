@@ -1,0 +1,230 @@
+import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { DEFAULT_SYSTEM_PROMPT } from "../constants";
+
+// --- Audio Processing Helpers ---
+
+function floatTo16BitPCM(float32Array: Float32Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (let i = 0; i < float32Array.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buffer;
+}
+
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+// --- Live Client ---
+
+export interface LiveClientCallbacks {
+  onOpen: () => void;
+  onClose: () => void;
+  onAudioPlay: () => void;
+  onAudioStop: () => void;
+  onTranscript?: (text: string, isUser: boolean) => void;
+}
+
+export class GeminiLiveClient {
+  private ai: GoogleGenAI;
+  private inputContext: AudioContext | null = null;
+  private outputContext: AudioContext | null = null;
+  private inputProcessor: ScriptProcessorNode | null = null;
+  private inputSource: MediaStreamAudioSourceNode | null = null;
+  private stream: MediaStream | null = null;
+  
+  private nextStartTime = 0;
+  private scheduledSources: Set<AudioBufferSourceNode> = new Set();
+  
+  // Callbacks
+  private callbacks: LiveClientCallbacks;
+  
+  // State
+  private isConnected = false;
+
+  constructor(callbacks: LiveClientCallbacks) {
+    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    this.callbacks = callbacks;
+  }
+
+  async connect() {
+    if (this.isConnected) return;
+
+    // Initialize Audio Contexts
+    this.inputContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    this.outputContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+    
+    // Get Mic Stream
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    // Connect to Gemini Live
+    const sessionPromise = this.ai.live.connect({
+      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+        },
+        systemInstruction: DEFAULT_SYSTEM_PROMPT,
+      },
+      callbacks: {
+        onopen: () => {
+          this.isConnected = true;
+          this.callbacks.onOpen();
+          this.startAudioInput(sessionPromise);
+        },
+        onmessage: (message: LiveServerMessage) => {
+          this.handleMessage(message);
+        },
+        onclose: () => {
+          this.disconnect();
+        },
+        onerror: (err) => {
+          console.error("Gemini Live Error:", err);
+          this.disconnect();
+        }
+      }
+    });
+  }
+
+  private startAudioInput(sessionPromise: Promise<any>) {
+    if (!this.inputContext || !this.stream) return;
+
+    this.inputSource = this.inputContext.createMediaStreamSource(this.stream);
+    // Use ScriptProcessor for raw PCM access (bufferSize, inputChannels, outputChannels)
+    this.inputProcessor = this.inputContext.createScriptProcessor(4096, 1, 1);
+    
+    this.inputProcessor.onaudioprocess = (e) => {
+      const inputData = e.inputBuffer.getChannelData(0);
+      const pcm16 = floatTo16BitPCM(inputData);
+      const base64 = arrayBufferToBase64(pcm16);
+      
+      sessionPromise.then(session => {
+        session.sendRealtimeInput({
+          media: {
+            mimeType: 'audio/pcm;rate=16000',
+            data: base64
+          }
+        });
+      });
+    };
+
+    this.inputSource.connect(this.inputProcessor);
+    this.inputProcessor.connect(this.inputContext.destination);
+  }
+
+  private async handleMessage(message: LiveServerMessage) {
+    // 1. Handle Server Content (Audio & Text)
+    const parts = message.serverContent?.modelTurn?.parts;
+    if (parts) {
+      for (const part of parts) {
+        // Audio
+        if (part.inlineData?.data && this.outputContext) {
+          await this.queueAudio(part.inlineData.data);
+        }
+        // Text (Transcript)
+        if (part.text && this.callbacks.onTranscript) {
+          this.callbacks.onTranscript(part.text, false);
+        }
+      }
+    }
+
+    // 2. Handle Interruption
+    if (message.serverContent?.interrupted) {
+      this.stopAllAudio();
+    }
+  }
+
+  private async queueAudio(base64: string) {
+    if (!this.outputContext) return;
+
+    // Decode PCM
+    const uint8 = base64ToUint8Array(base64);
+    const int16 = new Int16Array(uint8.buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768.0;
+    }
+
+    const buffer = this.outputContext.createBuffer(1, float32.length, 24000);
+    buffer.copyToChannel(float32, 0);
+
+    // Schedule
+    const source = this.outputContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.outputContext.destination);
+
+    // Sync timing
+    const currentTime = this.outputContext.currentTime;
+    if (this.nextStartTime < currentTime) {
+      this.nextStartTime = currentTime;
+    }
+    
+    source.start(this.nextStartTime);
+    this.nextStartTime += buffer.duration;
+    
+    this.scheduledSources.add(source);
+    
+    // Notify playing state
+    if (this.scheduledSources.size === 1) {
+       this.callbacks.onAudioPlay();
+    }
+
+    source.onended = () => {
+      this.scheduledSources.delete(source);
+      if (this.scheduledSources.size === 0) {
+        this.callbacks.onAudioStop();
+        // Reset time if we ran out of buffer to avoid huge gaps
+        if (this.outputContext) {
+           this.nextStartTime = this.outputContext.currentTime;
+        }
+      }
+    };
+  }
+
+  private stopAllAudio() {
+    this.scheduledSources.forEach(s => s.stop());
+    this.scheduledSources.clear();
+    this.nextStartTime = 0;
+    this.callbacks.onAudioStop();
+  }
+
+  disconnect() {
+    this.isConnected = false;
+    this.stopAllAudio();
+
+    // Cleanup Input
+    this.inputProcessor?.disconnect();
+    this.inputSource?.disconnect();
+    this.stream?.getTracks().forEach(t => t.stop());
+    if (this.inputContext && this.inputContext.state !== 'closed') {
+      this.inputContext.close();
+    }
+
+    // Cleanup Output
+    if (this.outputContext && this.outputContext.state !== 'closed') {
+      this.outputContext.close();
+    }
+
+    this.callbacks.onClose();
+  }
+}

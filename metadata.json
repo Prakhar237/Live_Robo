@@ -1,0 +1,7 @@
+{
+  "name": "Gemini Robot Face",
+  "description": "An animated robot face voice assistant powered by Gemini. Features real-time state visualization and high-quality Gemini TTS voices.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
