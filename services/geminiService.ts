@@ -51,18 +51,18 @@ export class GeminiLiveClient {
   private inputProcessor: ScriptProcessorNode | null = null;
   private inputSource: MediaStreamAudioSourceNode | null = null;
   private stream: MediaStream | null = null;
-  
+
   private nextStartTime = 0;
   private scheduledSources: Set<AudioBufferSourceNode> = new Set();
-  
+
   // Callbacks
   private callbacks: LiveClientCallbacks;
-  
+
   // State
   private isConnected = false;
 
   constructor(callbacks: LiveClientCallbacks) {
-    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    this.ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_API_KEY });
     this.callbacks = callbacks;
   }
 
@@ -72,7 +72,7 @@ export class GeminiLiveClient {
     // Initialize Audio Contexts
     this.inputContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
     this.outputContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    
+
     // Get Mic Stream
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
@@ -112,12 +112,12 @@ export class GeminiLiveClient {
     this.inputSource = this.inputContext.createMediaStreamSource(this.stream);
     // Use ScriptProcessor for raw PCM access (bufferSize, inputChannels, outputChannels)
     this.inputProcessor = this.inputContext.createScriptProcessor(4096, 1, 1);
-    
+
     this.inputProcessor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
       const pcm16 = floatTo16BitPCM(inputData);
       const base64 = arrayBufferToBase64(pcm16);
-      
+
       sessionPromise.then(session => {
         session.sendRealtimeInput({
           media: {
@@ -178,15 +178,15 @@ export class GeminiLiveClient {
     if (this.nextStartTime < currentTime) {
       this.nextStartTime = currentTime;
     }
-    
+
     source.start(this.nextStartTime);
     this.nextStartTime += buffer.duration;
-    
+
     this.scheduledSources.add(source);
-    
+
     // Notify playing state
     if (this.scheduledSources.size === 1) {
-       this.callbacks.onAudioPlay();
+      this.callbacks.onAudioPlay();
     }
 
     source.onended = () => {
@@ -195,7 +195,7 @@ export class GeminiLiveClient {
         this.callbacks.onAudioStop();
         // Reset time if we ran out of buffer to avoid huge gaps
         if (this.outputContext) {
-           this.nextStartTime = this.outputContext.currentTime;
+          this.nextStartTime = this.outputContext.currentTime;
         }
       }
     };
