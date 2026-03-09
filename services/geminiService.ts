@@ -42,14 +42,14 @@ export interface LiveClientCallbacks {
   onAudioPlay: () => void;
   onAudioStop: () => void;
   onTranscript?: (text: string, isUser: boolean) => void;
+  onStatsUpdate?: (stats: any) => void;
 }
 
 export class GeminiLiveClient {
   private ai: GoogleGenAI;
-  private session: any = null;
   private inputContext: AudioContext | null = null;
   private outputContext: AudioContext | null = null;
-  private workletNode: AudioWorkletNode | null = null;
+  private inputProcessor: ScriptProcessorNode | null = null;
   private inputSource: MediaStreamAudioSourceNode | null = null;
   private stream: MediaStream | null = null;
 
@@ -61,7 +61,24 @@ export class GeminiLiveClient {
 
   // State
   private isConnected = false;
-  private isSending = false;
+  private stats = {
+    packetsSent: 0,
+    packetsReceived: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    audioQueueSize: 0,
+    lastPacketTime: 0,
+    connected: false,
+    errors: 0
+  };
+
+  private notifyStats() {
+    this.stats.connected = this.isConnected;
+    this.stats.audioQueueSize = this.scheduledSources.size;
+    if (this.callbacks.onStatsUpdate) {
+      this.callbacks.onStatsUpdate({ ...this.stats });
+    }
+  }
 
   constructor(callbacks: LiveClientCallbacks) {
     this.ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_API_KEY });
@@ -79,8 +96,8 @@ export class GeminiLiveClient {
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
     // Connect to Gemini Live
-    this.session = await this.ai.live.connect({
-      model: 'gemini-live-2.5-flash-native-audio',
+    const sessionPromise = this.ai.live.connect({
+      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -91,8 +108,9 @@ export class GeminiLiveClient {
       callbacks: {
         onopen: () => {
           this.isConnected = true;
+          this.notifyStats();
           this.callbacks.onOpen();
-          this.startAudioInput();
+          this.startAudioInput(sessionPromise);
         },
         onmessage: (message: LiveServerMessage) => {
           this.handleMessage(message);
@@ -102,56 +120,57 @@ export class GeminiLiveClient {
         },
         onerror: (err) => {
           console.error("Gemini Live Error:", err);
+          this.stats.errors++;
+          this.notifyStats();
           this.disconnect();
         }
       }
     });
   }
 
-  private async startAudioInput() {
-    this.isSending = false;
+  private startAudioInput(sessionPromise: Promise<any>) {
     if (!this.inputContext || !this.stream) return;
 
-    // Load the AudioWorklet processor
-    await this.inputContext.audioWorklet.addModule('/audio-processor.worklet.js');
-
     this.inputSource = this.inputContext.createMediaStreamSource(this.stream);
+    // Use ScriptProcessor for raw PCM access (bufferSize, inputChannels, outputChannels)
+    this.inputProcessor = this.inputContext.createScriptProcessor(4096, 1, 1);
 
-    // Create worklet node — runs off main thread, 128-sample buffer (8ms latency vs 256ms)
-    this.workletNode = new AudioWorkletNode(this.inputContext, 'pcm-processor');
-
-    this.workletNode.port.onmessage = (event) => {
-      if (!this.isSending || !this.session) return;
-
-      const float32 = event.data as Float32Array;
-      const pcm16 = floatTo16BitPCM(float32);
+    this.inputProcessor.onaudioprocess = (e) => {
+      const inputData = e.inputBuffer.getChannelData(0);
+      const pcm16 = floatTo16BitPCM(inputData);
       const base64 = arrayBufferToBase64(pcm16);
 
-      try {
-        this.session.sendRealtimeInput({
+      sessionPromise.then(session => {
+        session.sendRealtimeInput({
           media: {
             mimeType: 'audio/pcm;rate=16000',
             data: base64
           }
         });
-      } catch (e) {
-        console.warn("Skipped sending audio chunk: connection closing");
-        this.isSending = false;
-      }
+
+        // Update stats
+        this.stats.packetsSent++;
+        this.stats.bytesSent += base64.length;
+        this.notifyStats();
+      });
     };
 
-    this.inputSource.connect(this.workletNode);
-    this.isSending = true;
-    // Note: Do NOT connect workletNode to destination — we don't want to hear mic playback
+    this.inputSource.connect(this.inputProcessor);
+    this.inputProcessor.connect(this.inputContext.destination);
   }
 
   private async handleMessage(message: LiveServerMessage) {
+    this.stats.packetsReceived++;
+    this.stats.lastPacketTime = Date.now();
+    this.notifyStats();
+
     // 1. Handle Server Content (Audio & Text)
     const parts = message.serverContent?.modelTurn?.parts;
     if (parts) {
       for (const part of parts) {
         // Audio
         if (part.inlineData?.data && this.outputContext) {
+          this.stats.bytesReceived += part.inlineData.data.length;
           await this.queueAudio(part.inlineData.data);
         }
         // Text (Transcript)
@@ -204,6 +223,7 @@ export class GeminiLiveClient {
 
     source.onended = () => {
       this.scheduledSources.delete(source);
+      this.notifyStats();
       if (this.scheduledSources.size === 0) {
         this.callbacks.onAudioStop();
         // Reset time if we ran out of buffer to avoid huge gaps
@@ -222,17 +242,11 @@ export class GeminiLiveClient {
   }
 
   disconnect() {
-    this.isSending = false;
-    this.session = null;
     this.isConnected = false;
     this.stopAllAudio();
 
     // Cleanup Input
-    if (this.workletNode) {
-      this.workletNode.port.onmessage = null;
-      this.workletNode.disconnect();
-      this.workletNode = null;
-    }
+    this.inputProcessor?.disconnect();
     this.inputSource?.disconnect();
     this.stream?.getTracks().forEach(t => t.stop());
     if (this.inputContext && this.inputContext.state !== 'closed') {
@@ -244,6 +258,7 @@ export class GeminiLiveClient {
       this.outputContext.close();
     }
 
+    this.notifyStats();
     this.callbacks.onClose();
   }
 }

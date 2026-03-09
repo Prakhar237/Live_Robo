@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import RobotFace from './components/RobotFace';
 import { GeminiLiveClient } from './services/geminiService';
 import { AppState, Emotion, RobotState } from './types';
+import DebugStats, { DebugMetrics } from './components/DebugStats';
 import { Power, Radio, Sparkles, Mic } from 'lucide-react';
 
 export default function App() {
@@ -20,6 +21,18 @@ export default function App() {
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationProgress, setGenerationProgress] = useState(0);
+
+  // Debug Stats State
+  const [debugMetrics, setDebugMetrics] = useState<DebugMetrics>({
+    packetsSent: 0,
+    packetsReceived: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    audioQueueSize: 0,
+    lastPacketTime: 0,
+    connected: false,
+    errors: 0
+  });
 
   const recognitionRef = useRef<any>(null);
 
@@ -72,6 +85,7 @@ export default function App() {
         onAudioPlay: () => setRobotState(prev => ({ ...prev, status: AppState.SPEAKING })),
         onAudioStop: () => setRobotState(prev => ({ ...prev, status: AppState.LISTENING })),
         onTranscript: (text) => setRobotState(prev => ({ ...prev, response: text })),
+        onStatsUpdate: (stats) => setDebugMetrics(stats),
       });
 
       clientRef.current = client;
@@ -209,6 +223,9 @@ export default function App() {
 
   return (
     <div className="flex w-full min-h-screen bg-[#000000] overflow-hidden relative font-body text-white">
+
+      {/* Temporary Debug Stats Panel */}
+      <DebugStats metrics={debugMetrics} />
 
       {/* LEFT / FULL SCREEN: RobotFace */}
       {/* 55% width for split screen */}
